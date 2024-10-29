@@ -1,0 +1,933 @@
+---
+title: "Bayesian Assignment"
+author: "Jonathan Koop"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  jsonlite,
+  dplyr,
+  purrr,
+  remstats,
+  remify,
+  MASS,
+  ggsoccer,
+  truncnorm,
+  extraDistr,
+  mvtnorm,
+  progress,
+  statmod,
+  abind,
+  ggplot2,
+  rvest,
+  stringr,
+  tidyr,
+  foreach,
+  doParallel,
+  xtable,
+  bain,
+  remstimate
+)
+```
+
+Set up parallel processing
+```{r}
+n.cores <- detectCores() - 1
+
+cluster <- parallel::makeCluster(
+  n.cores
+)
+registerDoParallel(cl = cluster)
+```
+
+
+
+# 1. Data Wrangling
+
+## 1.1 Reading in the Data
+```{r}
+# Load the JSON file
+data <- fromJSON("https://raw.githubusercontent.com/statsbomb/open-data/master/data/events/3895167.json", flatten = TRUE) # first game
+data_new <- fromJSON("https://raw.githubusercontent.com/statsbomb/open-data/master/data/events/3895320.json", flatten = TRUE) # second game
+```
+
+## 1.2 Data Preparation
+
+### 1.2.1 Extract Pass Events
+
+#### First Game
+
+```{r}
+# Extract pass events
+pass_events <- data %>%  # first game
+  filter(type.name == "Pass", is.na(pass.outcome.name), team.name == "VfB Stuttgart",
+         !is.na(pass.body_part.name)) %>% # filter for passes from VfB Stuttgart
+  mutate(time = minute * 60 + second, # convert minute and second to time in seconds
+         # split pass end into x and y coordinates
+         pass.end.x = map_chr(pass.end_location, 1),
+         pass.end.y = map_chr(pass.end_location, 2)) %>%
+  dplyr::select(time, player.name, player.id, starts_with("pass.")) %>%
+  filter(time <= 3912) # before first substitution
+
+# sort pass_events by time
+pass_events <- pass_events[order(pass_events$time),]
+```
+
+#### Second Game
+
+```{r}
+pass_events_new <- data_new %>%
+  mutate(time = minute * 60 + second) %>%
+  filter(time < 4438, # before first substitution
+         type.name == "Pass", is.na(pass.outcome.name), team.name == "VfB Stuttgart",
+         !is.na(pass.body_part.name)) %>%
+  dplyr::select(time, player.name, player.id, starts_with("pass."))
+```
+
+
+### 1.2.2 Remify the Data Frame
+
+#### First game
+```{r}
+# Prepare a data.frame to compute statistics 
+edgelist <- data.frame(
+	time   = pass_events$time, 
+	actor1 = pass_events$player.id,
+	actor2 = pass_events$pass.recipient.id)
+
+reh <- remify::remify(edgelist, model = "actor") # remify the data
+
+
+dictionary <- attributes(reh)$dictionary$actors # extract dictionary
+Events <- data.frame(matrix(NA, nrow = nrow(edgelist), ncol = 2)) # create empty data.frame
+colnames(Events) <- c("sender", "receiver") # set column names
+Events$sender <- match(edgelist$actor1, dictionary$actorName) # match sender to dictionary
+Events$receiver <- match(edgelist$actor2, dictionary$actorName) # match receiver to dictionary
+```
+
+
+#### Second game
+
+```{r}
+# Prepare a data.frame to compute statistics 
+edgelist_new <- data.frame(
+	time   = pass_events_new$time, 
+	actor1 = pass_events_new$player.id,
+	actor2 = pass_events_new$pass.recipient.id)
+
+reh_new <- remify::remify(edgelist_new, model = "actor")
+receiver_effects_new <- ~ inertia() + reciprocity()
+
+
+dictionary_new <- attributes(reh_new)$dictionary$actors
+Events_new <- data.frame(matrix(NA, nrow = nrow(edgelist_new), ncol = 2))
+colnames(Events_new) <- c("sender", "receiver")
+Events_new$sender <- match(edgelist_new$actor1, dictionary_new$actorName)
+Events_new$receiver <- match(edgelist_new$actor2, dictionary_new$actorName)
+```
+
+
+### 1.2.3 Player attributes
+
+#### Scrape Age
+```{r}
+page <- read_html("https://www.transfermarkt.com/vfb-stuttgart/startseite/verein/79/sort/age")
+  
+  # Extract player data
+age <- page %>%
+  html_nodes("table.items > tbody > tr") %>% # get html nodes
+  map_df(~{
+    jersey_number <- .x %>% # extract jersey number
+    html_node(".rn_nummer") %>%
+    html_text(trim = TRUE) %>%
+    as.integer() # convert to integer
+      
+    age <- .x %>% # extract age
+      html_node("td:nth-child(3)") %>% # filter node
+      html_text(trim = TRUE)
+    
+    data.frame(jersey_number = jersey_number, age = age, stringsAsFactors = FALSE)
+    }) %>%
+  mutate(age = str_extract(age, "\\(([^)]+)\\)")) %>% # extract age from string using regex
+  mutate(age = str_replace_all(age, "[()]", "")) # remove parentheses using regex
+```
+
+#### Extract Player Attributes
+
+##### First game
+
+```{r}
+# Extract player attributes from json
+attributes <- data[1,]$tactics.lineup[[1]]
+
+# add age matching on jersey_number
+attributes <- left_join(attributes, age, by = c("jersey_number" = "jersey_number"))
+
+attributes <- attributes[,-c(1,4)] # remove unnecessary columns
+attributes$time <- 0 # add time column for remstats later
+attributes$name <- attributes$player.id # rename player.id to name
+attributes$age <- as.integer(attributes$age) # convert age to integer
+```
+
+##### Second game
+
+```{r}
+# Extract player attributes from json
+attributes_new <- data_new[2,]$tactics.lineup[[1]]
+
+# add age matching on jersey_number
+attributes_new <- left_join(attributes_new, age, by = c("jersey_number" = "jersey_number"))
+
+attributes_new <- attributes_new[,-c(1,4)]
+attributes_new$time <- 0
+attributes_new$name <- attributes_new$player.id
+attributes_new$age <- as.integer(attributes_new$age) 
+```
+
+
+### 1.2.3 Average Distance
+
+#### First game
+
+Average positions
+```{r}
+# get average position for every player
+players.id <- attributes$player.id
+
+
+
+positions <- data %>%
+  filter(player.id %in% players.id, period == 1, !is.na(location), !is.na(player.id)) %>% # filter for first half and non-NA values
+  dplyr::select(location, player.id) # select location and player.id
+
+# Extract the x and y coordinates from the location column using base R
+positions$location.x <- sapply(positions$location, function(loc) if (!is.null(loc) && length(loc) >= 1) as.numeric(loc[1]) else NA)
+positions$location.y <- sapply(positions$location, function(loc) if (!is.null(loc) && length(loc) >= 2) as.numeric(loc[2]) else NA)
+
+# Calculate the means using base R
+avgloc <- aggregate(cbind(location.x, location.y) ~ player.id, data = positions, FUN = function(x) mean(x, na.rm = TRUE))
+
+# Rename the columns for clarity
+names(avgloc) <- c("player.id", "mean.x", "mean.y")
+```
+
+Check the average positions by plotting them on the pitch
+```{r}
+ggplot() +
+  annotate_pitch(dimensions = ggsoccer::pitch_statsbomb) +
+  theme_pitch() +
+  geom_point(data = avgloc, aes(x = mean.x, y = mean.y), color = "red") +
+  geom_text(data = avgloc, aes(x = mean.x, y = mean.y, label = player.id), vjust = -1, color = "red", size = 2)
+```
+
+```{r}
+distances <- merge(avgloc, avgloc, by = NULL, all = TRUE) %>%
+  filter(player.id.x != player.id.y) %>%
+  mutate(dist = sqrt((mean.x.x - mean.x.y)^2 + (mean.y.x - mean.y.y)^2))
+distances$sender.id <- match(distances$player.id.x, dictionary$actorName)
+distances$receiver.id <- match(distances$player.id.y, dictionary$actorName)
+distances <- distances[,7:9]
+
+dist.stat <- data.frame(matrix(ncol = 11, nrow = nrow(Events)))
+
+for (i in 1:nrow(Events)) {
+  sender <- Events[i,1]
+  dist <- distances[distances$sender.id == sender,]
+  dist <- dist[order(dist$receiver.id),]
+  dist.stat[i,-sender] <- dist$dist
+}
+```
+
+
+#### Second game
+
+Average positions
+```{r}
+# get average position for every player
+players.id_new <- attributes_new$player.id
+
+
+
+positions_new <- data_new %>%
+  filter(player.id %in% players.id_new, period == 1, !is.na(location), !is.na(player.id)) %>%
+  dplyr::select(location, player.id)
+
+# Extract the x and y coordinates from the location column using base R
+positions_new$location.x <- sapply(positions_new$location, function(loc) if (!is.null(loc) && length(loc) >= 1) as.numeric(loc[1]) else NA)
+positions_new$location.y <- sapply(positions_new$location, function(loc) if (!is.null(loc) && length(loc) >= 2) as.numeric(loc[2]) else NA)
+
+# Calculate the means using base R
+avgloc_new <- aggregate(cbind(location.x, location.y) ~ player.id, data = positions_new, FUN = function(x) mean(x, na.rm = TRUE))
+
+# Rename the columns for clarity
+names(avgloc_new) <- c("player.id", "mean.x", "mean.y")
+```
+
+```{r}
+ggplot() +
+  annotate_pitch(dimensions = ggsoccer::pitch_statsbomb) +
+  theme_pitch() +
+  geom_point(data = avgloc_new, aes(x = mean.x, y = mean.y), color = "red") +
+  geom_text(data = avgloc_new, aes(x = mean.x, y = mean.y, label = player.id), vjust = -1, color = "red", size = 2)
+```
+
+```{r}
+distances_new <- merge(avgloc_new, avgloc_new, by = NULL, all = TRUE) %>%
+  filter(player.id.x != player.id.y) %>%
+  mutate(dist = sqrt((mean.x.x - mean.x.y)^2 + (mean.y.x - mean.y.y)^2))
+distances_new$sender.id <- match(distances_new$player.id.x, dictionary_new$actorName)
+distances_new$receiver.id <- match(distances_new$player.id.y, dictionary_new$actorName)
+distances_new <- distances_new[,7:9]
+
+dist.stat_new <- data.frame(matrix(ncol = 11, nrow = nrow(Events_new)))
+
+for (i in 1:nrow(Events_new)) {
+  sender <- Events_new[i,1]
+  dist <- distances_new[distances_new$sender.id == sender,]
+  dist <- dist[order(dist$receiver.id),]
+  dist.stat_new[i,-sender] <- dist$dist
+}
+```
+
+
+### 1.2.4 Statistics
+
+#### First Game
+
+```{r}
+receiver_effects <- ~ inertia() + reciprocity() + difference("age") # define receiver effects
+stats <- remstats(receiver_effects = receiver_effects, reh = reh, attr_actors = attributes) # calculate statistics
+out <- remstats(receiver_effects = receiver_effects, reh = reh, attr_actors = attributes)$receiver_stats # extract receiver statistics
+
+X <- array(NA, dim = c(nrow(pass_events), 11, 4))
+X[,,1] <- out[,,1]
+X[,,2] <- out[,,2]
+X[,,3] <- out[,,3]
+X[,,4] <- as.matrix(dist.stat)
+
+stats$receiver_stats
+```
+
+#### Second Game
+
+```{r}
+receiver_effects_new <- ~ inertia() + reciprocity() + difference("age")
+stats_new <- remstats(receiver_effects = receiver_effects_new, reh = reh_new, attr_actors = attributes_new)
+out_new <- remstats(receiver_effects = receiver_effects_new, reh = reh_new, attr_actors = attributes_new)$receiver_stats
+
+X_new <- array(NA, dim = c(nrow(pass_events_new), 11, 4))
+X_new[,,1] <- out_new[,,1]
+X_new[,,2] <- out_new[,,2]
+X_new[,,3] <- out_new[,,3]
+X_new[,,4] <- as.matrix(dist.stat_new)
+```
+
+
+### 1.2.5 Standardization
+
+#### First Game
+
+```{r}
+std_X <- lapply(1:dim(X)[3], function(i) {
+  # Calculate mean and sd ignoring NAs
+  x_mean <- mean(X[,,i], na.rm = TRUE)
+  x_sd <- sd(X[,,i], na.rm = TRUE)
+  
+  # Standardize
+  (X[,,i] - x_mean) / x_sd
+})
+
+# Combine the standardized matrices along the 3rd dimension (slices in array)
+std_X <- do.call(abind, args = list(std_X, along = 3))
+
+# Check the standard deviation of each slice
+apply(std_X, 3, mean, na.rm = TRUE)
+apply(std_X, 3, sd, na.rm = TRUE)
+
+# Set the dimension names
+dimnames(std_X) <- dimnames(X)
+
+stats$receiver_stats <- std_X
+```
+
+#### Second Game
+
+```{r}
+std_X_new <- lapply(1:dim(X_new)[3], function(i) {
+  # Calculate mean and sd ignoring NAs
+  x_mean <- mean(X_new[,,i], na.rm = TRUE)
+  x_sd <- sd(X_new[,,i], na.rm = TRUE)
+  
+  # Standardize
+  (X_new[,,i] - x_mean) / x_sd
+})
+
+# Combine the standardized matrices along the 3rd dimension (slices in array)
+std_X_new <- do.call(abind, args = list(std_X_new, along = 3))
+
+# Check the standard deviation of each slice
+apply(std_X_new, 3, mean, na.rm = TRUE)
+apply(std_X_new, 3, sd, na.rm = TRUE)
+
+# Set the dimension names
+dimnames(std_X_new) <- dimnames(X_new)
+
+stats_new$receiver_stats <- std_X_new
+```
+
+# 2. Sampler
+
+```{r}
+gibbs.sampler <- function(Events, X, 
+                 iter = 10000, burnin = 1000, store = 10,
+                 start = 0,
+                 seed = 123, 
+                 prior = "flat",
+                 mu0 = NULL, Sigma0 = NULL) {
+  set.seed(seed)
+  
+  M <- nrow(Events) # set M
+  actors <- dim(X)[2] # set number of potential receivers (N-1)
+  P <- dim(X)[3] # set number of predictors
+  
+  # Starting values for beta
+  beta <- rep(start, P)
+  vals <- matrix(NA, nrow = (iter+burnin), ncol = P)
+  Z <- matrix(1, M, actors)
+  
+  # starting value for Z
+  for (i in 1:M) { 
+    Z[i, -Events[i, 2]] <- truncnorm::rtruncnorm(actors-1, a = rep(-Inf, actors-1), b = rep(0, actors-1), mean = 0, sd = 1) # sample Z for nonactive actors
+    Z[, 1] <- 0 # constrain first actor to 0
+    Z[i, Events[i, 1]] <- NA # set Z of sender to NA
+  }
+  Z_max <- apply(Z, 1, function(row) max(row, na.rm = TRUE)) # get Z_max for every event
+  
+  # Iteratively sample from conditional posteriors
+  for (i in 1:(iter+burnin)) {
+    XtX <- Reduce("+", lapply(1:M, function(time) t(X[time, -Events[time, 1], ]) %*% X[time, -Events[time, 1], ])) # sum XtX (for Sigma)
+    XtZ <- Reduce("+", lapply(1:M, function(time) t(X[time, -Events[time, 1], ]) %*% Z[time, -Events[time, 1]])) # sum XtZ (for mu)
+    
+    if (prior == "flat") {
+      post.mu <- as.vector(solve(XtX) %*% XtZ) # if prior flat: mean is (XtX)^-1*XtZ
+      post.sigma <- as.matrix(solve(XtX)) # if prior flat: variance is (XtX)^-1
+    } else if (prior == "normal") {
+      if (is.null(mu0) || is.null(Sigma0)) {
+        stop("mu0 and Sigma0 must be provided for normal prior") # error if prior mean or var not provided
+      }
+      Sigma0_inv <- solve(Sigma0) # inverse of sigma0
+      post.sigma <- as.matrix(solve(XtX + Sigma0_inv)) # if prior normal: variance is (XtX + Sigma0^-1)^-1
+      post.mu <- as.vector(post.sigma %*% (XtZ + Sigma0_inv %*% mu0)) # if prior normal: mean is (XtX + Sigma0^-1)^-1 * (XtZ + Sigma0^-1 * mu0)
+    }
+    
+    vals[i, 1:P] <- beta <- mvtnorm::rmvnorm(1, mean = post.mu, sigma = post.sigma) # store sampled value
+    
+    means <- apply(X, 1, function(row) row %*% as.vector(beta))
+    
+    # Retrieve nonactive actors, senders and receivers
+    nonactive <- matrix(NA, M, actors-2)
+    receiver <- rep(NA, M)
+    sender <- rep(NA, M)
+    
+    # Calculate Z
+    for (j in 1:M) {
+      nonactive[j, ] <- (1:actors)[-c(Events[j, 1], Events[j, 2])] # actors other than sender and receiver
+      receiver[j] <- Events[j, 2] # receiver of each event
+      sender[j] <- Events[j, 1] # sender of each event
+      
+      Z[j, nonactive[j, ]] <- truncnorm::rtruncnorm(actors-2,
+                                         mean = means[nonactive[j, ], j],
+                                         sd = 1, a = -Inf, b = Z_max[j]) # sample Z for nonactive actors
+      Z[j, sender[j]] <- NA # set Z of sender to NA
+      Z[j, receiver[j]] <- truncnorm::rtruncnorm(1, mean = means[receiver[j], j], sd = 1,
+                                      a = max(Z[j, nonactive[j, ]]), b = Inf) # sample Z for receiver
+      Z[j, 1] <- 0 # constrain first actor to 0
+    }
+    
+    Z_max <- apply(Z, 1, function(row) max(row, na.rm = TRUE)) # get Z_max for every event
+  }
+  
+  vals <- vals[seq((burnin+1), nrow(vals), by = store), ] # store only values after burnin and thinning
+  
+   beta_mode <- numeric(P) # vector for posterior mode
+   beta_mean <- numeric(P) # vector for posterior mean
+   beta_median <- numeric(P) # vector for posterior median
+   
+   for (i in 1:P) {
+     # Posterior mode by variable
+     density_est <- density(vals[, i]) # estimate density
+     mode_val <- density_est$x[which.max(density_est$y)] # get mode of density
+     beta_mode[i] <- mode_val # store mode
+     
+     # Posterior mean
+     beta_mean[i] <- mean(vals[, i])
+     
+     # Posterior median
+     beta_median[i] <- median(vals[, i])
+   }
+   
+   names(beta_mode) <- paste0("b", 1:P) # set names for beta_mode
+   names(beta_mean) <- paste0("b", 1:P) # set names for beta_mean
+   names(beta_median) <- paste0("b", 1:P) # set names for beta_median
+   
+   beta_cov <- cov(vals) # covariance matrix of beta
+  
+  return(list(vals = vals, 
+              beta_mode = beta_mode, beta_mean = beta_mean, beta_median = beta_median, beta_cov = beta_cov,
+              Sigma = post.sigma, M = M, N = (actors-1), P = P))
+}
+```
+
+
+# 3. Application
+
+## 3.1 Results from Sampler
+
+First game
+
+```{r}
+results.gibbs.sampler <- list() # create list to store results
+results.gibbs.sampler <- foreach(seed = 1:3) %dopar% { # run sampler in parallel for faster computation
+  results <- gibbs.sampler(Events, std_X, burnin = 1000, iter = 50000, store = 5, prior = "flat", seed = seed) # run with flat prior and burnin 1000, iter 50000, store 5
+}
+
+# save results.gibbs.sampler
+save(results.gibbs.sampler, file = "resultsgibbs.sampler.RData")
+```
+
+Second game
+
+```{r}
+results.gibbs.sampler.new <- list()
+results.gibbs.sampler.new <- foreach(seed = 1:3) %dopar% {
+  results <- gibbs.sampler(Events_new, std_X_new, burnin = 1000, iter = 50000, store = 5, prior = "flat", seed = seed)
+}
+
+# save results.gibbs.sampler
+save(results.gibbs.sampler.new, file = "resultsgibbs.samplernew.RData")
+```
+
+Updated
+
+```{r}
+results.gibbs.sampler.updated <- list()
+results.gibbs.sampler.updated <- foreach(seed = 1:3) %dopar% {
+  results <- gibbs.sampler(Events_new, std_X_new, burnin = 1000, iter = 50000, store = 5, prior = "normal", seed = seed,
+                  mu0 = results.gibbs.sampler[[1]]$beta_mean, Sigma0 = results.gibbs.sampler[[1]]$beta_cov)
+}
+
+# save results.gibbs.sampler
+save(results.gibbs.sampler.updated, file = "resultsgibbs.samplerupdated.RData")
+```
+
+
+
+### 3.1.1 Trace Plot
+
+```{r}
+trace_data <- map_dfr(results.gibbs.sampler, ~ {
+  data.frame(
+    iter = 1:nrow(.x$vals), # create iteration column
+    # create beta columns
+    beta1 = .x$vals[,1],
+    beta2 = .x$vals[,2],
+    beta3 = .x$vals[,3],
+    beta4 = .x$vals[,4]
+  )
+}, .id = "trace")
+
+trace_data_long <- trace_data %>%
+  pivot_longer(cols = starts_with("beta"), names_to = "beta", values_to = "value") # turn data wide to long
+
+# Define custom labels
+beta_labels <- c("beta1" = "Inertia", 
+                 "beta2" = "Reciprocity", 
+                 "beta3" = "Age Difference", 
+                 "beta4" = "Average Distance")
+
+# Plot trace plots from each element of the list (one plot with 3 lines per coefficient) with ggplot
+# Plot the trace plots
+ggplot(trace_data_long, aes(x = iter, y = value, color = trace)) +
+  geom_line(alpha = 0.6) + # set line transparency
+  facet_wrap(~ beta, scales = "free_y", labeller = labeller(beta = as_labeller(beta_labels))) + # wrap by beta
+  ylim(range(trace_data_long$value)) + # set y limits
+  geom_hline(yintercept = 0, linetype = "dashed") + # add dashed line at 0
+  theme_minimal() +
+  labs(title = "Trace Plots For First Game", x = "Iteration", y = "Value", color = "Chain") # add labs
+
+# save plot in /output in 5:3
+ggsave("output/trace_plots.png", width = 5, height = 3)
+```
+
+```{r}
+trace_data_new <- map_dfr(results.gibbs.sampler.new, ~ {
+  data.frame(
+    iter = 1:nrow(.x$vals),
+    beta1 = .x$vals[,1],
+    beta2 = .x$vals[,2],
+    beta3 = .x$vals[,3],
+    beta4 = .x$vals[,4]
+  )
+}, .id = "trace")
+
+trace_data_new_long <- trace_data_new %>%
+  pivot_longer(cols = starts_with("beta"), names_to = "beta", values_to = "value")
+
+# Plot trace plots from each element of the list (one plot with 3 lines per coefficient) with ggplot
+# Plot the trace plots
+ggplot(trace_data_new_long, aes(x = iter, y = value, color = trace)) +
+  geom_line(alpha = 0.6) +
+  facet_wrap(~ beta, scales = "free_y", labeller = labeller(beta = as_labeller(beta_labels))) +
+  ylim(range(trace_data_new_long$value)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Trace Plots For Second Game", x = "Iteration", y = "Value", color = "Chain")
+
+# save plot in /output in 5:3
+ggsave("output/trace_plots_new.png", width = 5, height = 3)
+```
+
+```{r}
+trace_data_upd <- map_dfr(results.gibbs.sampler.updated, ~ {
+  data.frame(
+    iter = 1:nrow(.x$vals),
+    beta1 = .x$vals[,1],
+    beta2 = .x$vals[,2],
+    beta3 = .x$vals[,3],
+    beta4 = .x$vals[,4]
+  )
+}, .id = "trace")
+
+trace_data_upd_long <- trace_data_upd %>%
+  pivot_longer(cols = starts_with("beta"), names_to = "beta", values_to = "value")
+
+# Plot trace plots from each element of the list (one plot with 3 lines per coefficient) with ggplot
+# Plot the trace plots
+ggplot(trace_data_upd_long, aes(x = iter, y = value, color = trace)) +
+  geom_line(alpha = 0.6) +
+  facet_wrap(~ beta, scales = "free_y", labeller = labeller(beta = as_labeller(beta_labels))) +
+  ylim(range(trace_data_upd_long$value)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Trace Plots After Updating", x = "Iteration", y = "Value", color = "Chain")
+
+# save plot in /output in 5:3
+ggsave("output/trace_plots_upd.png", width = 5, height = 3)
+```
+
+### 3.1.2 Gelman Rubin Statistic
+
+```{r}
+gelman_rubin <- function(data) {
+  data <- data %>% # retrieve mean and variance by chain
+    group_by(trace) %>%
+    summarise(mean_value = mean(value), var_value = var(value), .groups = 'drop')
+  
+  m <- n_distinct(data$trace)  # number of chains
+  n <- nrow(trace_data_long) / m  # length of each chain
+  
+  B <- n * var(data$mean_value)  # between-chain variance
+  W <- mean(data$var_value)  # within-chain variance
+  
+  var_plus <- ((n - 1) / n) * W + (1 / n) * B
+  R_hat <- sqrt(var_plus / W)
+  
+  return(R_hat)
+}
+
+# Apply the function to each beta
+trace_data_long %>%
+  group_by(beta) %>% # group by beta
+  summarise(R_hat = gelman_rubin(cur_data()), .groups = 'drop') # calculate R_hat
+
+trace_data_new_long %>%
+  group_by(beta) %>%
+  summarise(R_hat = gelman_rubin(cur_data()), .groups = 'drop')
+
+trace_data_upd_long %>%
+  group_by(beta) %>%
+  summarise(R_hat = gelman_rubin(cur_data()), .groups = 'drop')
+```
+
+### 3.1.3 Density Plots
+
+First game
+```{r}
+# Function to calculate the HPD interval
+hpd_interval <- function(sample, prob = 0.95) {
+  # Sort the sample
+  sorted_sample <- sort(sample)
+  
+  # Calculate the number of points in the HPD interval
+  n <- length(sorted_sample)
+  interval_length <- floor(prob * n)
+  
+  # Initialize the variables to store the minimum interval
+  min_width <- Inf
+  min_interval <- c(0, 0)
+  
+  # Loop over all possible intervals and find the smallest one
+  for (i in 1:(n - interval_length)) {
+    interval_width <- sorted_sample[i + interval_length] - sorted_sample[i] # calculate width of interval
+    if (interval_width < min_width) { # if width is smaller than current minimum
+      min_width <- interval_width # update minimum width
+      min_interval <- c(sorted_sample[i], sorted_sample[i + interval_length]) # update minimum interval
+    }
+  }
+  
+  return(min_interval)
+}
+
+# apply the function to each beta
+hpd_intervals <- data.frame(
+  beta = unique(trace_data_long$beta),
+  lower = sapply(unique(trace_data_long$beta), function(b) hpd_interval(results.gibbs.sampler[[1]]$vals[, as.numeric(gsub("beta", "", b))], prob = .95)[1]),
+  upper = sapply(unique(trace_data_long$beta), function(b) hpd_interval(results.gibbs.sampler[[1]]$vals[, as.numeric(gsub("beta", "", b))], prob = .95)[2])
+)
+
+# Merge HPD intervals with the original data for plotting
+trace_data_long <- merge(trace_data_long, hpd_intervals, by = "beta")
+
+# Plot
+ggplot(trace_data_long[trace_data_long$trace == 1, ], aes(x = value)) +
+  geom_density(alpha = 0.3, fill = "grey") +
+  facet_wrap(~ beta, scales = "free", labeller = labeller(beta = as_labeller(beta_labels))) +
+  xlim(range(trace_data_long$value)) +
+  theme_minimal() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "darkgrey") +
+  geom_vline(aes(xintercept = lower), color = "black", linetype = "dashed") + 
+  geom_vline(aes(xintercept = upper), color = "black", linetype = "dashed") +
+  labs(title = "Density Plots For First Game", x = "Parameter Value", y = "Density")
+
+
+# save plot in /output in 5:3
+ggsave("output/density_plots.png", width = 5, height = 3)
+```
+
+Second game
+```{r}
+hpd_intervals <- data.frame(
+  beta = unique(trace_data_new_long$beta),
+  lower = sapply(unique(trace_data_new_long$beta), function(b) hpd_interval(results.gibbs.sampler.new[[1]]$vals[, as.numeric(gsub("beta", "", b))], prob = .95)[1]),
+  upper = sapply(unique(trace_data_new_long$beta), function(b) hpd_interval(results.gibbs.sampler.new[[1]]$vals[, as.numeric(gsub("beta", "", b))], prob = .95)[2])
+)
+
+# Merge HPD intervals with the original data for plotting
+trace_data_new_long <- merge(trace_data_new_long, hpd_intervals, by = "beta")
+
+# Plot
+ggplot(trace_data_new_long[trace_data_new_long$trace == 1, ], aes(x = value)) +
+  geom_density(alpha = 0.3, fill = "grey") +
+  facet_wrap(~ beta, scales = "free", labeller = labeller(beta = as_labeller(beta_labels))) +
+  xlim(range(trace_data_new_long$value)) +
+  theme_minimal() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "darkgrey") +
+  geom_vline(aes(xintercept = lower), color = "black", linetype = "dashed") + 
+  geom_vline(aes(xintercept = upper), color = "black", linetype = "dashed") +
+  labs(title = "Density Plots For Second Game", x = "Parameter Value", y = "Density")
+
+
+# save plot in /output in 5:3
+ggsave("output/density_plots_new.png", width = 5, height = 3)
+```
+
+Updated Model
+```{r}
+hpd_intervals <- data.frame(
+  beta = unique(trace_data_upd_long$beta),
+  lower = sapply(unique(trace_data_upd_long$beta), function(b) hpd_interval(results.gibbs.sampler.updated[[1]]$vals[, as.numeric(gsub("beta", "", b))], prob = .95)[1]),
+  upper = sapply(unique(trace_data_upd_long$beta), function(b) hpd_interval(results.gibbs.sampler.updated[[1]]$vals[, as.numeric(gsub("beta", "", b))], prob = .95)[2])
+)
+
+# Merge HPD intervals with the original data for plotting
+trace_data_upd_long <- merge(trace_data_upd_long, hpd_intervals, by = "beta")
+
+# Plot
+ggplot(trace_data_upd_long[trace_data_upd_long$trace == 1, ], aes(x = value)) +
+  geom_density(alpha = 0.3, fill = "grey") +
+  facet_wrap(~ beta, scales = "free", labeller = labeller(beta = as_labeller(beta_labels))) +
+  xlim(range(trace_data_upd_long$value)) +
+  theme_minimal() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "darkgrey") +
+  geom_vline(aes(xintercept = lower), color = "black", linetype = "dashed") + 
+  geom_vline(aes(xintercept = upper), color = "black", linetype = "dashed") +
+  labs(title = "Density Plots After Updating", x = "Parameter Value", y = "Density")
+
+
+# save plot in /output in 5:3
+ggsave("output/density_plots_upd.png", width = 5, height = 3)
+```
+Plot Influence of prior and likelihood
+```{r}
+ggplot() +
+  geom_density(data = trace_data_long[trace_data_long$trace == 1, ], # plot density of prior
+               aes(x = value, fill = "Game 1 (Prior)", color = "Game 1 (Prior)"), alpha = 0.3) +
+  geom_density(data = trace_data_new_long[trace_data_new_long$trace == 1, ], # plot density of likelihood
+               aes(x = value, fill = "Game 2 (Likelihood)", color = "Game 2 (Likelihood)"), alpha = 0.3) +
+  geom_density(data = trace_data_upd_long[trace_data_upd_long$trace == 1, ], # plot density of posterior
+               aes(x = value, fill = "Posterior", color = "Posterior"), alpha = 0.3) +
+  facet_wrap(~ beta, scales = "free", labeller = labeller(beta = as_labeller(beta_labels))) +
+  scale_color_manual(name = "Data", values = c("Game 1 (Prior)" = "green", "Game 2 (Likelihood)" = "blue", "Posterior" = "red")) +
+  scale_fill_manual(name = "Data", values = c("Game 1 (Prior)" = "green", "Game 2 (Likelihood)" = "blue", "Posterior" = "red")) +
+  theme_minimal() +
+  labs(title = "Influence of Prior and Likelihood", x = "Parameter Value", y = "Density")
+
+ggsave("output/influence_prior_lik.png", width = 9, height = 3)
+```
+
+
+## 3.2 Results from Sampler used in Paper
+
+### 3.2.1 Function from Paper
+
+```{r}
+load("functions_Karimovaetal.RData")
+```
+
+
+### 3.2.2 Applying the Function
+
+```{r}
+Events[,3] <- Events[,2] # add index column
+results.paper <- flat.actor(Events, std_X) # apply function
+colMeans(results.paper$beta) # calculate mean of beta
+```
+
+### 3.2.3 Results from `remstimate`
+```{r}
+# Estimate the model with MLE that should be similar to the results from the sampler with flat prior
+model <- remstimate(reh = reh,
+                    stats = stats,
+                    method = "MLE")
+summary(model) # print summary
+```
+
+### 3.2.4 Checking the Sampler with Prior
+
+```{r}
+# Influence of prior mean
+means <- list()
+means[[1]] <- rep(-10, 4) # set prior mean to -10
+means[[2]] <- rep(0, 4) # set prior mean to 0
+means[[3]] <- rep(10, 4) # set prior mean to 10
+
+gibbs.prior.mean.check <- list()
+
+for (i in 1:3) {
+  gibbs.prior.mean.check[[i]] <- gibbs.sampler(Events_new, std_X_new, burnin = 100, iter = 5000, store = 5, prior = "normal",
+                  mu0 = means[[i]], Sigma0 = results.gibbs.sampler[[1]]$Sigma)
+}
+
+# Influence of Prior Variance
+varfactor <- list()
+varfactor[[1]] <- rep(0.001, 4) # multiply prior variance by 0.001
+varfactor[[2]] <- rep(1, 4) # multiply prior variance by 1
+varfactor[[3]] <- rep(100, 4) # multiply prior variance by 100
+
+gibbs.prior.var.check <- list()
+for (i in 1:3) {
+  gibbs.prior.var.check[[i]] <- gibbs.sampler(Events_new, std_X_new, burnin = 100, iter = 5000, store = 5, prior = "normal",
+                  mu0 = results.gibbs.sampler[[1]]$beta_mean, Sigma0 = varfactor[[i]]*results.gibbs.sampler[[1]]$Sigma)
+}
+```
+
+Sampler successfully accounts for prior mean and variance. The higher the prior variance, the lower the influence of the prior and the higher the posterior variance. The posterior mean is between the posterior mean and variance.
+# 4. Hypothesis Testing Framework
+
+## 4.1 Using `bain`
+
+```{r}
+(bain <- bain(x = results.gibbs.sampler.updated[[1]]$beta_mean, # mean of posterior
+     "-b3<b2<b1<-b4;-b3<b1<b2<-b4;b2<-b3<b1<-b4;b1<-b3<b2<-b4", # hypotheses
+     Sigma = results.gibbs.sampler.updated[[1]]$Sigma, # covariance matrix
+     n = results.gibbs.sampler.updated[[1]]$M * results.gibbs.sampler.updated[[1]]$N))
+```
+
+## 4.2 Manual Computation
+
+Due to the fact that no integration of a multivariate normal distribution with limits regarding the diffent variables, a sampling approach was taken. This is expected to be less accurate than the `bain` function as it is based on sampling from the prior and posterior distributions.
+
+```{r}
+set.seed(123)
+
+# Parameters
+mean_prior <- rep(0, 4) # set prior mean to 0
+n_samples <- 10000000 # set number of samples
+Sigma.prior.bain <- results.gibbs.sampler.updated[[1]]$Sigma / bain$b # set prior variance to bain to compare
+Sigma.prior.brob <- results.gibbs.sampler.updated[[1]]$Sigma / 0.017 # set prior variance to 0.017 for b_robust
+beta_updated <- results.gibbs.sampler.updated[[1]]$beta_mean # set posterior mean
+
+# Generate samples
+complexity.samples <- mvrnorm(n_samples, mu = mean_prior, Sigma = Sigma.prior.brob) # sample from prior for complexity
+fit.samples <- mvrnorm(n_samples, mu = beta_updated, Sigma = results.gibbs.sampler.updated[[1]]$Sigma) # sample from posterior for fit
+
+# function to calculate proportion of samples that support each hypothesis
+calc_h <- function(samples) {
+  h1 <- mean((-samples[, 3] < samples[, 2]) & (samples[, 2] < samples[, 1]) & (samples[, 1] < -samples[, 4])) # calculate proportion of samples supporting hypothesis 1
+  h2 <- mean((-samples[, 3] < samples[, 1]) & (samples[, 1] < samples[, 2]) & (samples[, 2] < -samples[, 4])) # calculate proportion of samples supporting hypothesis 2
+  h3 <- mean((samples[, 2] < -samples[, 3]) & (-samples[, 3] < samples[, 1]) & (samples[, 1] < -samples[, 4])) # calculate proportion of samples supporting hypothesis 3
+  h4 <- mean((samples[, 1] < -samples[, 3]) & (-samples[, 3] < samples[, 2]) & (samples[, 2] < -samples[, 4])) # calculate proportion of samples supporting hypothesis 4
+  c(h1, h2, h3, h4) # return vector of proportions
+}
+
+(complexity_h <- calc_h(complexity.samples)) # calculate proportions for complexity
+(fit_h <- calc_h(fit.samples)) # calculate proportions for fit
+
+# Calculate Bayes Factors
+(BF_u <- fit_h / complexity_h)
+(BF_u_sum <- sum(BF_u))
+(PMPa <- BF_u / BF_u_sum)
+(PMPb <- BF_u / (BF_u_sum+1))
+
+# Create data frame for results
+results.h <- data.frame(
+  Hypothesis = c("H1", "H2", "H3", "H4"),
+  Fit = fit_h,
+  Complexity = complexity_h,
+  BF_u = BF_u,
+  PMPa = PMPa,
+  PMPb = PMPb
+)
+
+# Print results as latex table
+print(xtable(results.h), include.rownames = FALSE)
+```
+
+## 4.3 Sensitivity Analysis
+
+```{r}
+set.seed(123)
+
+# Parameters
+mean_prior <- rep(0, 4)
+n_samples <- 10000000
+Sigma.prior.bain <- results.gibbs.sampler.updated[[1]]$Sigma / bain$b
+beta_updated <- results.gibbs.sampler.updated[[1]]$beta_mean
+
+# Generate samples
+complexity.samples <- mvrnorm(n_samples, mu = mean_prior, Sigma = Sigma.prior.bain)
+fit.samples <- mvrnorm(n_samples, mu = beta_updated, Sigma = results.gibbs.sampler.updated[[1]]$Sigma)
+
+(complexity_h <- calc_h(complexity.samples))
+(fit_h <- calc_h(fit.samples))
+
+# Calculate Bayes Factors
+(BF_u <- fit_h / complexity_h)
+(BF_u_sum <- sum(BF_u))
+(PMPa <- BF_u / BF_u_sum)
+(PMPb <- BF_u / (BF_u_sum+1))
+```
+
+
+```{r}
+stopCluster(cl = cluster)
+```
+
